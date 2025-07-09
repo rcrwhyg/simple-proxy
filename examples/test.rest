@@ -1,0 +1,32 @@
+# Rest Client
+
+@host = http://localhost:3000
+
+### Get Users
+GET {{host}}/users
+
+### Create User
+POST {{host}}/users
+Content-Type: application/json
+
+{
+  "email": "test@example.com",
+  "password": "password",
+  "name": "Test User"
+}
+
+### Get User
+GET {{host}}/users/2
+
+### Update User
+PUT {{host}}/users/2
+Content-Type: application/json
+
+{
+  "email": "test2@example.com",
+  "password": "password",
+  "name": "Test User 2"
+}
+
+### Delete User
+DELETE {{host}}/users/2
