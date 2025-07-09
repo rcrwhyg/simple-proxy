@@ -15,16 +15,18 @@ categories = ["development-tools"]
 keywords = []
 
 [dependencies]
-axum = "0.8"
-dashmap = "6.1"
-argon2 = "0.5"
-tokio = { version = "1.46", features = ["full"] }
+anyhow = "1.0.98"
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-chrono = { version = "0.4", features = ["serde"] }
+tokio = { version = "1.46", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+argon2 = "0.5"
+axum = "0.8"
+chrono = { version = "0.4", features = ["serde"] }
+dashmap = "6.1"
+rand_core = { version = "0.6", features = ["std"] }
+serde_json = "1.0"
 tower = "0.5"
 tower-http = { version = "0.6", features = ["trace"] }
-rand_core = { version = "0.6", features = ["std"] }
-anyhow = "1.0.98"
