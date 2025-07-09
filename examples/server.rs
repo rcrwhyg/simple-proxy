@@ -5,7 +5,8 @@ use argon2::{
 use axum::{
     Json, Router,
     extract::{Path, State},
-    http::StatusCode,
+    http::{Request, StatusCode},
+    response::Response,
     routing::get,
 };
 use chrono::{DateTime, Utc};
@@ -15,9 +16,10 @@ use serde::{Deserialize, Serialize};
 use std::{
     net::SocketAddr,
     sync::{Arc, atomic::AtomicU64},
+    time::Duration,
 };
 use tower_http::trace::TraceLayer;
-use tracing::info;
+use tracing::{Span, info};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -218,7 +220,16 @@ async fn main() {
         )
         .route("/health", get(health_check))
         .layer(TraceLayer::new_for_http())
-        .with_state(app_state);
+        .with_state(app_state)
+        .layer(
+            TraceLayer::new_for_http()
+                .on_request(|request: &Request<_>, _span: &Span| {
+                    info!("on_request: {:?}", request);
+                })
+                .on_response(|response: &Response, _latency: Duration, _span: &Span| {
+                    info!("on_response: {:?}", response);
+                }),
+        );
 
     // 启动服务器
     let addr = SocketAddr::from(([127, 0, 0, 1], 3000));

@@ -1,6 +1,7 @@
 # Rest Client
 
-@host = http://localhost:3000
+# @host = http://localhost:3000
+@host = http://localhost:7080
 
 ### Get Users
 GET {{host}}/users
@@ -16,10 +17,10 @@ Content-Type: application/json
 }
 
 ### Get User
-GET {{host}}/users/2
+GET {{host}}/users/1
 
 ### Update User
-PUT {{host}}/users/2
+PUT {{host}}/users/1
 Content-Type: application/json
 
 {
@@ -29,4 +30,4 @@ Content-Type: application/json
 }
 
 ### Delete User
-DELETE {{host}}/users/2
+DELETE {{host}}/users/1
