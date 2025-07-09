@@ -12,8 +12,12 @@ use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
-use std::sync::{Arc, atomic::AtomicU64};
+use std::{
+    net::SocketAddr,
+    sync::{Arc, atomic::AtomicU64},
+};
 use tower_http::trace::TraceLayer;
+use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -73,15 +77,9 @@ impl AppState {
         self.inner.users.get(&id).map(|user| user.clone())
     }
 
-    fn create_user(&self, req: CreateUserRequest) -> Result<User, String> {
+    fn create_user(&self, req: CreateUserRequest) -> Result<User, anyhow::Error> {
         // 生成密码哈希
-        let salt = SaltString::generate(&mut OsRng);
-        let password_hash = self
-            .inner
-            .argon2
-            .hash_password(req.password.as_bytes(), &salt)
-            .map_err(|e| format!("密码哈希失败: {e}"))?
-            .to_string();
+        let password_hash = hash_password(&self.inner.argon2, &req.password)?;
 
         let id = self
             .inner
@@ -102,25 +100,15 @@ impl AppState {
         Ok(user)
     }
 
-    fn update_user(&self, id: u64, req: UpdateUserRequest) -> Result<User, String> {
-        let mut user_ref = self
-            .inner
-            .users
-            .get_mut(&id)
-            .ok_or("用户不存在".to_string())?;
+    fn update_user(&self, id: u64, req: UpdateUserRequest) -> Option<User> {
+        let mut user_ref = self.get_user(id)?;
 
         if let Some(email) = req.email {
             user_ref.email = email;
         }
 
         if let Some(password) = req.password {
-            let salt = SaltString::generate(&mut OsRng);
-            let password_hash = self
-                .inner
-                .argon2
-                .hash_password(password.as_bytes(), &salt)
-                .map_err(|e| format!("密码哈希失败: {e}"))?
-                .to_string();
+            let password_hash = hash_password(&self.inner.argon2, &password).ok()?;
             user_ref.password = password_hash;
         }
 
@@ -130,7 +118,7 @@ impl AppState {
 
         user_ref.update_at = Utc::now();
         let updated_user = user_ref.clone();
-        Ok(updated_user)
+        Some(updated_user)
     }
 
     fn delete_user(&self, id: u64) -> Option<User> {
@@ -153,15 +141,21 @@ impl AppState {
     }
 }
 
+fn hash_password(argon2: &Argon2<'static>, password: &str) -> Result<String, anyhow::Error> {
+    let salt = SaltString::generate(&mut OsRng);
+    let password_hash = argon2
+        .hash_password(password.as_bytes(), &salt)
+        .map_err(|_| anyhow::anyhow!("Failed to hash password"))?
+        .to_string();
+    Ok(password_hash)
+}
+
 // 处理函数
 async fn get_user(
     Path(id): Path<u64>,
     State(state): State<AppState>,
 ) -> Result<Json<User>, StatusCode> {
-    match state.get_user(id) {
-        Some(user) => Ok(Json(user)),
-        None => Err(StatusCode::NOT_FOUND),
-    }
+    state.get_user(id).map(Json).ok_or(StatusCode::NOT_FOUND)
 }
 
 async fn list_users(State(state): State<AppState>) -> Json<Vec<User>> {
@@ -174,7 +168,7 @@ async fn create_user(
 ) -> Result<(StatusCode, Json<User>), (StatusCode, String)> {
     match state.create_user(req) {
         Ok(user) => Ok((StatusCode::CREATED, Json(user))),
-        Err(err) => Err((StatusCode::BAD_REQUEST, err)),
+        Err(err) => Err((StatusCode::BAD_REQUEST, err.to_string())),
     }
 }
 
@@ -182,27 +176,18 @@ async fn update_user(
     Path(id): Path<u64>,
     State(state): State<AppState>,
     Json(req): Json<UpdateUserRequest>,
-) -> Result<Json<User>, (StatusCode, String)> {
-    match state.update_user(id, req) {
-        Ok(user) => Ok(Json(user)),
-        Err(err) => {
-            if err.contains("用户不存在") {
-                Err((StatusCode::NOT_FOUND, err))
-            } else {
-                Err((StatusCode::BAD_REQUEST, err))
-            }
-        }
-    }
+) -> Result<Json<User>, StatusCode> {
+    state
+        .update_user(id, req)
+        .map(Json)
+        .ok_or(StatusCode::NOT_FOUND)
 }
 
 async fn delete_user(
     Path(id): Path<u64>,
     State(state): State<AppState>,
 ) -> Result<Json<User>, StatusCode> {
-    match state.delete_user(id) {
-        Some(user) => Ok(Json(user)),
-        None => Err(StatusCode::NOT_FOUND),
-    }
+    state.delete_user(id).map(Json).ok_or(StatusCode::NOT_FOUND)
 }
 
 async fn health_check(State(state): State<AppState>) -> Json<HealthResponse> {
@@ -228,7 +213,7 @@ async fn main() {
     let app = Router::new()
         .route("/users", get(list_users).post(create_user))
         .route(
-            "/users/:id",
+            "/users/{id}",
             get(get_user).put(update_user).delete(delete_user),
         )
         .route("/health", get(health_check))
@@ -236,18 +221,17 @@ async fn main() {
         .with_state(app_state);
 
     // 启动服务器
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000")
-        .await
-        .unwrap();
+    let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
+    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
 
-    println!("服务器已启动，监听地址: {}", listener.local_addr().unwrap());
-    println!("API 端点:");
-    println!("  GET    /users       - 获取用户列表");
-    println!("  POST   /users       - 创建新用户");
-    println!("  GET    /users/{{id}}  - 获取指定用户");
-    println!("  PUT    /users/{{id}}  - 更新指定用户");
-    println!("  DELETE /users/{{id}}  - 删除指定用户");
-    println!("  GET    /health      - 健康检查");
+    info!("服务器已启动，监听地址: {}", listener.local_addr().unwrap());
+    info!("API 端点:");
+    info!("  GET    /users       - 获取用户列表");
+    info!("  POST   /users       - 创建新用户");
+    info!("  GET    /users/{{id}}  - 获取指定用户");
+    info!("  PUT    /users/{{id}}  - 更新指定用户");
+    info!("  DELETE /users/{{id}}  - 删除指定用户");
+    info!("  GET    /health      - 健康检查");
 
     axum::serve(listener, app).await.unwrap();
 }
