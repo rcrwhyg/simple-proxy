@@ -1,0 +1,253 @@
+use argon2::{
+    Argon2,
+    password_hash::{PasswordHasher, SaltString},
+};
+use axum::{
+    Json, Router,
+    extract::{Path, State},
+    http::StatusCode,
+    routing::get,
+};
+use chrono::{DateTime, Utc};
+use dashmap::DashMap;
+use rand_core::OsRng;
+use serde::{Deserialize, Serialize};
+use std::sync::{Arc, atomic::AtomicU64};
+use tower_http::trace::TraceLayer;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct User {
+    id: u64,
+    email: String,
+    #[serde(skip_serializing)]
+    password: String,
+    name: String,
+    create_at: DateTime<Utc>,
+    update_at: DateTime<Utc>,
+}
+
+#[derive(Clone)]
+struct AppState {
+    inner: Arc<AppStateInner>,
+}
+
+struct AppStateInner {
+    next_id: AtomicU64,
+    users: DashMap<u64, User>,
+    argon2: Argon2<'static>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateUserRequest {
+    email: String,
+    password: String,
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateUserRequest {
+    email: Option<String>,
+    password: Option<String>,
+    name: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct HealthResponse {
+    status: String,
+    timestamp: DateTime<Utc>,
+}
+
+impl AppState {
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(AppStateInner {
+                next_id: AtomicU64::new(1),
+                users: DashMap::new(),
+                argon2: Argon2::default(),
+            }),
+        }
+    }
+
+    fn get_user(&self, id: u64) -> Option<User> {
+        self.inner.users.get(&id).map(|user| user.clone())
+    }
+
+    fn create_user(&self, req: CreateUserRequest) -> Result<User, String> {
+        // 生成密码哈希
+        let salt = SaltString::generate(&mut OsRng);
+        let password_hash = self
+            .inner
+            .argon2
+            .hash_password(req.password.as_bytes(), &salt)
+            .map_err(|e| format!("密码哈希失败: {e}"))?
+            .to_string();
+
+        let id = self
+            .inner
+            .next_id
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let now = Utc::now();
+
+        let user = User {
+            id,
+            email: req.email,
+            password: password_hash,
+            name: req.name,
+            create_at: now,
+            update_at: now,
+        };
+
+        self.inner.users.insert(id, user.clone());
+        Ok(user)
+    }
+
+    fn update_user(&self, id: u64, req: UpdateUserRequest) -> Result<User, String> {
+        let mut user_ref = self
+            .inner
+            .users
+            .get_mut(&id)
+            .ok_or("用户不存在".to_string())?;
+
+        if let Some(email) = req.email {
+            user_ref.email = email;
+        }
+
+        if let Some(password) = req.password {
+            let salt = SaltString::generate(&mut OsRng);
+            let password_hash = self
+                .inner
+                .argon2
+                .hash_password(password.as_bytes(), &salt)
+                .map_err(|e| format!("密码哈希失败: {e}"))?
+                .to_string();
+            user_ref.password = password_hash;
+        }
+
+        if let Some(name) = req.name {
+            user_ref.name = name;
+        }
+
+        user_ref.update_at = Utc::now();
+        let updated_user = user_ref.clone();
+        Ok(updated_user)
+    }
+
+    fn delete_user(&self, id: u64) -> Option<User> {
+        self.inner.users.remove(&id).map(|(_, user)| user)
+    }
+
+    fn health(&self) -> HealthResponse {
+        HealthResponse {
+            status: "healthy".to_string(),
+            timestamp: Utc::now(),
+        }
+    }
+
+    fn list_users(&self) -> Vec<User> {
+        self.inner
+            .users
+            .iter()
+            .map(|entry| entry.value().clone())
+            .collect()
+    }
+}
+
+// 处理函数
+async fn get_user(
+    Path(id): Path<u64>,
+    State(state): State<AppState>,
+) -> Result<Json<User>, StatusCode> {
+    match state.get_user(id) {
+        Some(user) => Ok(Json(user)),
+        None => Err(StatusCode::NOT_FOUND),
+    }
+}
+
+async fn list_users(State(state): State<AppState>) -> Json<Vec<User>> {
+    Json(state.list_users())
+}
+
+async fn create_user(
+    State(state): State<AppState>,
+    Json(req): Json<CreateUserRequest>,
+) -> Result<(StatusCode, Json<User>), (StatusCode, String)> {
+    match state.create_user(req) {
+        Ok(user) => Ok((StatusCode::CREATED, Json(user))),
+        Err(err) => Err((StatusCode::BAD_REQUEST, err)),
+    }
+}
+
+async fn update_user(
+    Path(id): Path<u64>,
+    State(state): State<AppState>,
+    Json(req): Json<UpdateUserRequest>,
+) -> Result<Json<User>, (StatusCode, String)> {
+    match state.update_user(id, req) {
+        Ok(user) => Ok(Json(user)),
+        Err(err) => {
+            if err.contains("用户不存在") {
+                Err((StatusCode::NOT_FOUND, err))
+            } else {
+                Err((StatusCode::BAD_REQUEST, err))
+            }
+        }
+    }
+}
+
+async fn delete_user(
+    Path(id): Path<u64>,
+    State(state): State<AppState>,
+) -> Result<Json<User>, StatusCode> {
+    match state.delete_user(id) {
+        Some(user) => Ok(Json(user)),
+        None => Err(StatusCode::NOT_FOUND),
+    }
+}
+
+async fn health_check(State(state): State<AppState>) -> Json<HealthResponse> {
+    Json(state.health())
+}
+
+#[tokio::main]
+async fn main() {
+    // 初始化日志
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                format!("{}=debug,tower_http=debug", env!("CARGO_CRATE_NAME")).into()
+            }),
+        )
+        .with(tracing_subscriber::fmt::layer())
+        .init();
+
+    // 创建应用状态
+    let app_state = AppState::new();
+
+    // 构建路由
+    let app = Router::new()
+        .route("/users", get(list_users).post(create_user))
+        .route(
+            "/users/:id",
+            get(get_user).put(update_user).delete(delete_user),
+        )
+        .route("/health", get(health_check))
+        .layer(TraceLayer::new_for_http())
+        .with_state(app_state);
+
+    // 启动服务器
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000")
+        .await
+        .unwrap();
+
+    println!("服务器已启动，监听地址: {}", listener.local_addr().unwrap());
+    println!("API 端点:");
+    println!("  GET    /users       - 获取用户列表");
+    println!("  POST   /users       - 创建新用户");
+    println!("  GET    /users/{{id}}  - 获取指定用户");
+    println!("  PUT    /users/{{id}}  - 更新指定用户");
+    println!("  DELETE /users/{{id}}  - 删除指定用户");
+    println!("  GET    /health      - 健康检查");
+
+    axum::serve(listener, app).await.unwrap();
+}
